@@ -1,6 +1,6 @@
 using KernelAbstractions: @kernel, @index
 
-using Oceananigans.Fields: reduced_dimensions, 
+using Oceananigans.Fields: reduced_dimensions,
                            instantiated_location,
                            fill_reduced_field_halos!
 
@@ -87,7 +87,7 @@ end
 #####
 
 function tupled_fill_halo_regions!(fields, grid::DistributedGrid, args...; kwargs...)
-    not_reduced_fields = fill_reduced_field_halos!(fields, args...; kwargs)
+    not_reduced_fields = fill_reduced_field_halos!(fields, args...; kwargs...)
 
     for field in not_reduced_fields
         # Make sure we are filling a `Field` type.
@@ -152,7 +152,7 @@ end
     end
 
     # Syncronous MPI fill_halo_event!
-    cooperative_waitall!(requests)
+    mpi_waitall(requests)
 
     # Reset MPI tag
     arch.mpi_tag[] -= arch.mpi_tag[]
@@ -172,7 +172,7 @@ function fill_corners!(c, connectivity, indices, loc, arch, grid, buffers, args.
     fill_send_buffers!(c, buffers, grid, Val(:corners))
     sync_device!(arch)
 
-    requests = MPI.Request[]
+    requests = []
 
     reqsw = fill_southwest_halo!(c, connectivity.southwest, indices, loc, arch, grid, buffers, buffers.southwest, args...; kw...)
     reqse = fill_southeast_halo!(c, connectivity.southeast, indices, loc, arch, grid, buffers, buffers.southeast, args...; kw...)
@@ -328,7 +328,7 @@ for side in sides
             send_tag = $side_send_tag(arch, grid, location)
 
             @debug "Sending " * $side_str * " halo: local_rank=$local_rank, rank_to_send_to=$rank_to_send_to, send_tag=$send_tag"
-            send_req = MPI.Isend(send_buffer, rank_to_send_to, send_tag, arch.communicator)
+            send_req = mpi_isend(send_buffer, rank_to_send_to, send_tag, arch.communicator)
 
             return send_req
         end
@@ -354,11 +354,57 @@ for side in sides
             recv_tag = $side_recv_tag(arch, grid, location)
 
             @debug "Receiving " * $side_str * " halo: local_rank=$local_rank, rank_to_recv_from=$rank_to_recv_from, recv_tag=$recv_tag"
-            recv_req = MPI.Irecv!(recv_buffer, rank_to_recv_from, recv_tag, arch.communicator)
+            recv_req = mpi_irecv!(recv_buffer, rank_to_recv_from, recv_tag, arch.communicator)
 
             return recv_req
         end
 
         @inline $get_side_recv_buffer(c, grid, buffers, arch) = buffers.$side.recv
     end
+end
+
+# Define GPU-aware double-buffered MPI wrappers
+using CUDA
+
+struct CuIrecvRequest{T}
+  req::MPI.Request
+  device_array::AbstractArray{T}
+  host_buffer::AbstractArray{T}
+end
+
+function mpi_isend(buffer, rank_to_send_to, send_tag, comm)
+  if CUDA.has_cuda() && buffer isa CuArray
+    host_buf = Array(buffer)
+    return MPI.Isend(host_buf, rank_to_send_to, send_tag, comm)
+  else
+    return MPI.Isend(buffer, rank_to_send_to, send_tag, comm)
+  end
+end
+
+function mpi_irecv!(dest, source, tag, comm)
+  if CUDA.has_cuda() && dest isa CuArray
+    host_buf = Array(dest)
+    req = MPI.Irecv!(host_buf, source, tag, comm)
+    return CuIrecvRequest{eltype(dest)}(req, dest, host_buf)
+  else
+    return MPI.Irecv!(dest, source, tag, comm)
+  end
+end
+
+function mpi_waitall(requests)
+  host_reqs = MPI.Request[]
+  mapping = Dict{MPI.Request, CuIrecvRequest}()
+  for r in requests
+    if r isa CuIrecvRequest
+      push!(host_reqs, r.req)
+      mapping[r.req] = r
+    else
+      push!(host_reqs, r)
+    end
+  end
+  MPI.Waitall(host_reqs)
+  for (host_req, cu_req) in mapping
+    copyto!(cu_req.device_array, cu_req.host_buffer)
+  end
+  return nothing
 end
